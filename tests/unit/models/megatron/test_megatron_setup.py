@@ -1377,6 +1377,7 @@ class TestValidateAndSetConfig:
                 },
             },
             "offload_optimizer_for_logprob": False,
+            "use_pinned_optimizer_offload": False,
         }
 
         with pytest.raises(NotImplementedError) as exc_info:
@@ -1412,6 +1413,7 @@ class TestValidateAndSetConfig:
                 "tensor_model_parallel_size": 2,
             },
             "offload_optimizer_for_logprob": False,
+            "use_pinned_optimizer_offload": False,
         }
 
         # The function would fail on setup_model_config, but we test the initial parsing
