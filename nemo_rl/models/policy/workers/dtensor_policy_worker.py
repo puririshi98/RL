@@ -800,6 +800,20 @@ class DTensorPolicyWorkerImpl(
                             if len(vlm_kwargs) > 0:
                                 del model_args["flash_attn_kwargs"]
 
+                            # Gemma 4 requires mm_token_type_ids even for text-only inputs
+                            if (
+                                getattr(
+                                    getattr(self.model, "config", None),
+                                    "model_type",
+                                    None,
+                                )
+                                == "gemma4"
+                            ):
+                                if "mm_token_type_ids" not in model_args:
+                                    model_args["mm_token_type_ids"] = torch.zeros_like(
+                                        input_ids
+                                    )
+
                             outputs = self.model(**model_args)
 
                         # Get logprobs
@@ -1131,6 +1145,18 @@ class DTensorPolicyWorkerImpl(
                         if len(vlm_kwargs) > 0:
                             del model_args["flash_attn_kwargs"]
 
+                        # Gemma 4 requires mm_token_type_ids even for text-only inputs
+                        if (
+                            getattr(
+                                getattr(self.model, "config", None), "model_type", None
+                            )
+                            == "gemma4"
+                        ):
+                            if "mm_token_type_ids" not in model_args:
+                                model_args["mm_token_type_ids"] = torch.zeros_like(
+                                    input_ids
+                                )
+
                         outputs = self.model(**model_args)
 
                     logits = outputs.logits
@@ -1396,6 +1422,19 @@ class DTensorPolicyWorkerImpl(
                             position_ids=position_ids,
                             use_cache=False,
                         )
+
+                        # Gemma 4 requires mm_token_type_ids even for text-only inputs
+                        if (
+                            getattr(
+                                getattr(self.model, "config", None), "model_type", None
+                            )
+                            == "gemma4"
+                        ):
+                            if "mm_token_type_ids" not in model_args:
+                                model_args["mm_token_type_ids"] = torch.zeros_like(
+                                    input_ids
+                                )
+
                         outputs = self.model(**model_args)
 
                     if not hasattr(outputs, "logits"):
@@ -1565,6 +1604,18 @@ class DTensorPolicyWorkerImpl(
                         )
                         if len(vlm_kwargs) > 0:
                             del model_args["flash_attn_kwargs"]
+
+                        # Gemma 4 requires mm_token_type_ids even for text-only inputs
+                        if (
+                            getattr(
+                                getattr(self.model, "config", None), "model_type", None
+                            )
+                            == "gemma4"
+                        ):
+                            if "mm_token_type_ids" not in model_args:
+                                model_args["mm_token_type_ids"] = torch.zeros_like(
+                                    input_ids
+                                )
 
                         outputs = self.model(**model_args)
 
