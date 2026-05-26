@@ -721,31 +721,26 @@ def tau_bench_data_processor(
       - extra_env_info: {task_index, episode_id, step_count}
       - task_name: "tau_bench"
 
-    The full system + user prompt is collapsed into a single message_log entry
-    (role "user") whose content is the chat-template-formatted string.  This is
-    the same layout used by math_hf_data_processor and is required because the
-    multi-turn rollout loop appends subsequent turns on top of this entry.
+    Each message in messages ([system_message, initial_user_message]) is kept as
+    its own message_log entry with its correct role.  get_formatted_message_log
+    tokenizes each message's delta incrementally so that token_ids for each entry
+    covers only that message's tokens, not the full conversation.  The assistant
+    generation prompt is appended to the last user message so the rollout loop
+    can begin generating immediately.
     """
     messages = datum_dict["messages"]
     extra_env_info = datum_dict["extra_env_info"]
 
-    formatted: str = tokenizer.apply_chat_template(  # type: ignore[assignment]
+    message_log: LLMMessageLogType = get_formatted_message_log(
         messages,
-        tokenize=False,
+        tokenizer,
+        task_data_spec,
+        add_bos_token=True,
+        add_eos_token=False,
         add_generation_prompt=True,
-        add_special_tokens=False,
     )
-    token_ids = tokenizer(
-        formatted,
-        return_tensors="pt",
-        add_special_tokens=False,
-    )["input_ids"][0]
 
-    message_log: LLMMessageLogType = [
-        {"role": "user", "content": formatted, "token_ids": token_ids}
-    ]
-
-    length = len(token_ids)
+    length = sum(len(msg["token_ids"]) for msg in message_log)
     loss_multiplier = 1.0
     if length >= max_seq_length:
         for msg in message_log:

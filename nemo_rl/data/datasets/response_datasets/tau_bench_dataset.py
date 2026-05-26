@@ -99,11 +99,17 @@ def _build_records(tau_bench_env_name: str, split: str) -> list[dict[str, Any]]:
     # time. We read task.instruction directly — env.reset() is intentionally
     # NOT called here because HumanUserSimulationEnv.reset() blocks on
     # input(), which would hang the process for every task.
+    # task_index=0: tau_bench's default (task_index=None) uses
+    # random.randint(0, len(tasks)) which is inclusive on both ends and
+    # occasionally returns len(tasks), causing an IndexError.  We only need
+    # the env for its metadata (tools, wiki, rules, task list), so any valid
+    # index works.
     env = get_env(
         env_name=tau_bench_env_name,
         user_strategy="human",
         user_model="",
         task_split=split,
+        task_index=0,
     )
 
     system_prompt = _build_system_prompt(env, tau_bench_env_name)

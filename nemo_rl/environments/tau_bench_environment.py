@@ -32,6 +32,14 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
+# Substrings that indicate a transient upstream API failure worth retrying.
+_TRANSIENT_HTTP_PHRASES = (
+    "502", "503", "504",
+    "bad gateway", "service unavailable",
+    "timeout", "timed out",
+    "429", "rate limit",
+)
+
 _JUDGE_SYSTEM_PROMPT = """\
 You are evaluating a customer service AI agent. You will be given the domain rules and \
 policies the agent must follow, the customer's original request, and the full conversation.
@@ -67,6 +75,10 @@ class TauBenchEnvConfig(TypedDict):
             Ignored when user_strategy is "mock".
         judge_api_key: API key for the judge model server. Ignored when user_strategy is "mock".
         judge_weight: Blend weight: 0.0 = pure tau-bench reward, 1.0 = pure judge score.
+        worker_stagger_delay_s: Seconds to delay each successive worker's first API call.
+            Spreading requests avoids a thundering-herd burst that can overwhelm the
+            inference endpoint. Worker i sleeps i * worker_stagger_delay_s before its
+            first API call. Default: 1.0.
         mock_user_latency_s: Seconds to sleep per mock user simulator call.
         mock_judge_latency_s: Seconds to sleep per mock judge call.
         mock_stop_prob: Probability that the mock user simulator ends the conversation on
@@ -85,6 +97,7 @@ class TauBenchEnvConfig(TypedDict):
     judge_base_url: NotRequired[str | None]
     judge_api_key: NotRequired[str | None]
     judge_weight: float
+    worker_stagger_delay_s: NotRequired[float]
     mock_user_latency_s: NotRequired[float | None]
     mock_judge_latency_s: NotRequired[float | None]
     mock_stop_prob: NotRequired[float | None]
@@ -196,6 +209,45 @@ class TauBenchWorker:
                 os.environ["OPENAI_API_KEY"] = user_api_key
             elif "OPENAI_API_KEY" not in os.environ:
                 os.environ["OPENAI_API_KEY"] = "dummy"
+            # Set a global request timeout so truly hung API calls fail within a
+            # bounded time. The timeout must be long enough to accommodate
+            # legitimately slow inference responses (the NVIDIA inference endpoint
+            # can take 60-90s under load); a timeout that is too short converts
+            # normal slow responses into spurious failures and retry storms.
+            # 120s gives ample headroom for slow responses while still bounding
+            # genuinely stuck connections (vs the OS TCP timeout of ~10 min).
+            import litellm as _litellm
+            _litellm.request_timeout = 120
+
+    def _call_with_retry(self, fn: Any, max_retries: int = 5, base_delay: float = 2.0) -> Any:
+        """Call fn, retrying on transient API errors with exponential back-off.
+
+        Uses full-jitter backoff (uniform sample in [0, delay]) so that many
+        workers retrying simultaneously don't all hit the API at the same instant.
+
+        Re-raises as RuntimeError on exhaustion so Ray can serialize the
+        exception across actor boundaries (litellm exception classes are not
+        Ray-serializable and produce UnserializableException in the driver).
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                return fn()
+            except Exception as e:
+                if attempt >= max_retries:
+                    raise RuntimeError(
+                        f"[TauBench] API call failed after {max_retries + 1} attempts: {e}"
+                    ) from None
+                msg = str(e).lower()
+                if any(phrase in msg for phrase in _TRANSIENT_HTTP_PHRASES):
+                    delay = random.uniform(0, base_delay * (2 ** attempt))
+                    print(
+                        f"[TauBench] transient API error on attempt {attempt + 1}/{max_retries + 1},"
+                        f" retrying in {delay:.1f}s: {type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                else:
+                    raise RuntimeError(f"[TauBench] non-retryable API error: {type(e).__name__}: {e}") from None
 
     def _make_env(self, task_index: int) -> tuple:
         """Create and reset a tau-bench Env for a specific task index.
@@ -221,20 +273,35 @@ class TauBenchWorker:
         if self._mock_user:
             user_provider = user_provider or "openai"
 
-        env = get_env(
-            env_name=self._env_name,
-            user_strategy=tau_user_strategy,
-            user_model=user_model,
-            task_split=self._task_split,
-            user_provider=user_provider,
-            task_index=task_index,
-        )
         if self._mock_user:
             from unittest.mock import patch
+            env = get_env(
+                env_name=self._env_name,
+                user_strategy=tau_user_strategy,
+                user_model=user_model,
+                task_split=self._task_split,
+                user_provider=user_provider,
+                task_index=task_index,
+            )
             with patch("litellm.completion", self._mock_completion):
                 reset_response = env.reset(task_index=task_index)
         else:
-            reset_response = env.reset(task_index=task_index)
+            # Both get_env() and env.reset() make LLM API calls:
+            # LLMUserSimulationEnv.__init__ calls self.reset() during get_env(),
+            # and env.reset() generates the customer's opening message.
+            # Wrap both together so a transient failure retries from scratch.
+            def _create_and_reset() -> tuple:
+                env = get_env(
+                    env_name=self._env_name,
+                    user_strategy=tau_user_strategy,
+                    user_model=user_model,
+                    task_split=self._task_split,
+                    user_provider=user_provider,
+                    task_index=task_index,
+                )
+                return env, env.reset(task_index=task_index)
+
+            env, reset_response = self._call_with_retry(_create_and_reset)
         initial_obs = str(reset_response.observation)
         return env, initial_obs
 
@@ -315,6 +382,7 @@ class TauBenchWorker:
         message_batch: List[str],
         metadata_batch: List[TauBenchEnvMetadata],
         judge_weight: float,
+        initial_delay_s: float = 0.0,
     ) -> Tuple[
         List[Dict[str, str]],
         List[bool],
@@ -327,10 +395,14 @@ class TauBenchWorker:
             message_batch: Latest assistant response texts, one per sample.
             metadata_batch: Per-episode state dicts, one per sample.
             judge_weight: Blending weight between tau-bench reward and judge score.
+            initial_delay_s: Seconds to sleep before issuing any API request.
+                Used to stagger workers so they don't all hit the endpoint at once.
 
         Returns:
             Tuple of (observations, terminateds, rewards, updated_metadata).
         """
+        if initial_delay_s > 0.0:
+            time.sleep(initial_delay_s)
         observations: List[Dict[str, str]] = []
         terminateds: List[bool] = []
         rewards: List[float] = []
@@ -346,10 +418,12 @@ class TauBenchWorker:
                 self._active_envs[episode_id] = {
                     "env": tau_env,
                     "initial_obs": initial_obs,
+                    "conversation": [],  # list of (label, text) for episode logging
                 }
 
             env_state = self._active_envs[episode_id]
             tau_env = env_state["env"]
+            conversation: List[Tuple[str, str]] = env_state["conversation"]
 
             if env_state.get("initial_obs") is not None:
                 # Pre-step: return the user simulator's actual opening message
@@ -358,6 +432,14 @@ class TauBenchWorker:
                 # discarded here; the agent will generate its real first response
                 # on the next turn after seeing the customer's actual message.
                 initial_obs = env_state.pop("initial_obs")
+                # Record the wasted agent response and the real customer opening.
+                conversation.append(("AGENT", agent_text.strip()))
+                conversation.append(("CUSTOMER", initial_obs.strip()))
+                #print(
+                #    f"[TauBench] episode={episode_id}  task={task_index}"
+                #    f"  PRE-STEP: customer: {initial_obs[:200]}",
+                #    flush=True,
+                #)
                 observations.append({"role": "user", "content": initial_obs})
                 terminateds.append(False)
                 rewards.append(0.0)
@@ -376,8 +458,19 @@ class TauBenchWorker:
                 with patch("litellm.completion", self._mock_completion):
                     env_response = tau_env.step(action)
             else:
-                env_response = tau_env.step(action)
+                env_response = self._call_with_retry(lambda: tau_env.step(action))
             step_count += 1
+            #print(
+            #    f"[TauBench] episode={episode_id}  task={task_index}"
+            #    f"  step={step_count}  action={action.name}",
+            #    flush=True,
+            #)
+
+            # Record this agent turn and the resulting observation.
+            obs_role = "user" if action.name == "respond" else "tool"
+            obs_label = "CUSTOMER" if obs_role == "user" else "TOOL"
+            conversation.append(("AGENT", agent_text.strip()))
+            conversation.append((obs_label, str(env_response.observation).strip()))
 
             done = bool(env_response.done) or step_count >= self._max_steps
             reward = 0.0
@@ -412,11 +505,51 @@ class TauBenchWorker:
                 else:
                     reward = tau_reward
 
+                # Log episode summary with clean text (no template markup).
+                blended = reward
+                tasks_list = getattr(tau_env, "tasks", [])
+                task_instruction = (
+                    tasks_list[task_index].instruction[:150]
+                    if tasks_list and task_index < len(tasks_list)
+                    else ""
+                )
+                score_str = f"tau_reward={tau_reward:.3f}"
+                if judge_score is not None:
+                    score_str += f"  judge_score={judge_score:.3f}"
+                score_str += f"  blended={blended:.3f}"
+                #print(f"\n{'='*70}")
+                #print(
+                #    f"[TauBench] episode_id={episode_id}  task_index={task_index}  steps={step_count}\n"
+                #    f"  {score_str}"
+                #)
+                #if task_instruction:
+                #    print(f"  task: {task_instruction}")
+                #print("-" * 70)
+                #print("  CONVERSATION:")
+                for turn_num, (label, text) in enumerate(conversation, 1):
+                    if len(text) > 300:
+                        text = text[:300] + " ..."
+                    #print(f"  [{turn_num}] {label}: {text}")
+                #print("-" * 70)
+                tool_calls: List[Tuple[str, Any]] = []
+                for _label, _text in conversation:
+                    if _label == "AGENT":
+                        for _m in _TOOL_CALL_RE.finditer(_text):
+                            try:
+                                _p = json.loads(_m.group(1).strip())
+                                tool_calls.append((_p.get("name", "?"), _p.get("arguments", {})))
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                """if tool_calls:
+                    print("  AGENT ACTIONS (tool calls):")
+                    for i, (name, kwargs) in enumerate(tool_calls):
+                        print(f"  [{i}] {name}: {kwargs}")
+                else:
+                    print("  AGENT ACTIONS (tool calls): none")
+                print("=" * 70, flush=True)"""
+
                 del self._active_envs[episode_id]
 
-            # Use "user" for user-simulator responses and "tool" for tool results
-            # so rollouts.py can apply the correct chat-template role markers.
-            obs_role = "user" if action.name == "respond" else "tool"
             observations.append(
                 {"role": obs_role, "content": str(env_response.observation)}
             )
@@ -465,10 +598,22 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
         self.cfg = cfg
         self._num_workers = cfg["num_workers"]
         self._judge_weight = float(cfg["judge_weight"])
+        self._stagger_delay_s = float(cfg.get("worker_stagger_delay_s", 1.0))
+
+        # TauBenchWorkers call external LLM APIs that may only be reachable from
+        # specific nodes (e.g. the head node has outbound internet, compute nodes
+        # do not).  Pin workers to the same node that hosts TauBenchEnvironment
+        # itself so they share the same network access.
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+        _this_node = ray.get_runtime_context().get_node_id()
+        _schedule_here = NodeAffinitySchedulingStrategy(
+            node_id=_this_node, soft=False
+        )
 
         self._workers = [
             TauBenchWorker.options(
-                runtime_env={"py_executable": PY_EXECUTABLES.TAU_BENCH}
+                runtime_env={"py_executable": PY_EXECUTABLES.TAU_BENCH},
+                scheduling_strategy=_schedule_here,
             ).remote(
                 env_name=cfg["env_name"],
                 task_split=cfg["task_split"],
@@ -519,6 +664,7 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
                 chunked_messages[i],
                 chunked_metadata[i],
                 self._judge_weight,
+                i * self._stagger_delay_s,
             )
             for i in range(self._num_workers)
         ]

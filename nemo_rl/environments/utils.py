@@ -25,6 +25,10 @@ from nemo_rl.utils.venvs import create_local_venv_on_each_node
 class EnvRegistryEntry(TypedDict, total=False):
     actor_class_fqn: str
     default_processor: NotRequired[str]
+    # If True, the actor is pinned to the head node (the node running the Ray
+    # driver).  Use for environments that require access to resources — e.g.
+    # outbound internet — that are only available on the head node.
+    pin_to_head_node: NotRequired[bool]
 
 
 # Environment registry. Key is the env name, value is a dictionary with the actor class FQN and optional default processor.
@@ -55,6 +59,11 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     },
     "tau_bench": {
         "actor_class_fqn": "nemo_rl.environments.tau_bench_environment.TauBenchEnvironment",
+        # TauBenchWorkers call external LLM APIs.  On this cluster only the
+        # head node has outbound internet access, so pin the env (and its
+        # workers, which are already co-located via NodeAffinitySchedulingStrategy)
+        # to the head node.
+        "pin_to_head_node": True,
     },
 }
 
@@ -103,6 +112,12 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
     if len(chunks) > num_workers:
         chunks[num_workers - 1 :] = [sum(chunks[num_workers - 1 :], [])]
 
+    # Ceiling division can produce fewer chunks than workers when len(to_chunk) is not
+    # a multiple of chunk_size (e.g. len=5, num_workers=4 → chunk_size=2 → 3 chunks).
+    # Pad with empty lists so callers can always index up to num_workers-1.
+    if len(chunks) < num_workers:
+        chunks.extend([[] for _ in range(num_workers - len(chunks))])
+
     return chunks
 
 
@@ -110,7 +125,8 @@ def create_env(env_name: str, env_config: dict) -> EnvironmentInterface:
     assert env_name in ENV_REGISTRY, (
         f"Env name {env_name} is not registered in ENV_REGISTRY. Please call register_env() to register the environment."
     )
-    actor_class_fqn = ENV_REGISTRY[env_name]["actor_class_fqn"]
+    registry_entry = ENV_REGISTRY[env_name]
+    actor_class_fqn = registry_entry["actor_class_fqn"]
     actor_class = get_object(actor_class_fqn)
     actor_py_exec = get_actor_python_env(actor_class_fqn)
     extra_env_vars = {}
@@ -126,12 +142,20 @@ def create_env(env_name: str, env_config: dict) -> EnvironmentInterface:
             "VIRTUAL_ENV": actor_py_venv,
             "UV_PROJECT_ENVIRONMENT": actor_py_venv,
         }
-    env = actor_class.options(  # type: ignore # it's wrapped with ray.remote
-        runtime_env={
+    options_kwargs: Dict[str, Any] = {
+        "runtime_env": {
             "py_executable": actor_py_exec,
             "env_vars": {**dict(os.environ), **extra_env_vars},
         }
-    ).remote(env_config)
+    }
+    if registry_entry.get("pin_to_head_node"):
+        import ray
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        options_kwargs["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(), soft=False
+        )
+    env = actor_class.options(**options_kwargs).remote(env_config)  # type: ignore # it's wrapped with ray.remote
     return env
 
 

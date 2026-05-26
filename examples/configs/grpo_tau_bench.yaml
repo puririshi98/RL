@@ -24,7 +24,7 @@ grpo:
 
 checkpointing:
   checkpoint_dir: "results/grpo-tau-bench"
-  metric_name: "val:tau_bench/task_completion_rate"
+  metric_name: "val:accuracy"
   higher_is_better: true
 
 policy:
@@ -46,7 +46,7 @@ policy:
     max_new_tokens: 512   # per turn; tool calls are short
     temperature: 1.0
     top_p: 1.0
-    stop_strings: null    # stop strings are supplied per-turn by the environment
+    stop_strings: null    # turn separator prepended to each observation by _tokenize_env_observation
     stop_token_ids: null
     vllm_cfg:
       async_engine: false
@@ -90,6 +90,10 @@ env:
     judge_base_url: null # unused when judge_model="mock"
     judge_api_key: null # unused when judge_model="mock"
     judge_weight: 0.3   # 70% task-completion + 30% judge score
+    # Stagger API requests across workers to avoid a thundering-herd burst.
+    # Worker i sleeps i * worker_stagger_delay_s before its first API call.
+    # Set to 0 to disable. Ignored when user_strategy="mock".
+    worker_stagger_delay_s: 1.0
     mock_user_latency_s: 0.1  # seconds to sleep per mock user simulator call
     mock_judge_latency_s: 0.1  # seconds to sleep per mock judge call
     mock_stop_prob: 0.4

@@ -21,6 +21,9 @@ import unittest.mock as mock
 import pytest
 import torch
 
+# litellm is installed only in the TAU_BENCH Ray venv, not the driver venv.
+_litellm_available = importlib.util.find_spec("litellm") is not None
+
 
 # ---------------------------------------------------------------------------
 # Module-level mocks: tau_bench is an optional dependency not available in CI
@@ -40,6 +43,13 @@ class MockAction:
     def __repr__(self):
         return f"Action(name={self.name!r}, kwargs={self.kwargs!r})"
 
+
+# Stub litellm before any nemo_rl import: litellm is installed only in the
+# TAU_BENCH Ray venv, not the driver venv.  All tests that use it patch
+# litellm.completion directly, so we only need a minimal placeholder here.
+_litellm = _make_module("litellm")
+_litellm.completion = mock.MagicMock()
+sys.modules.setdefault("litellm", _litellm)
 
 # Patch tau_bench before any nemo_rl import that would transitively pull it.
 _tau_bench = _make_module("tau_bench")
@@ -65,6 +75,7 @@ from nemo_rl.environments.tau_bench_environment import (
     TauBenchEnvironment,
     TauBenchWorker,
     _TOOL_CALL_RE,
+    _TRANSIENT_HTTP_PHRASES,
 )
 
 # ---------------------------------------------------------------------------
@@ -95,13 +106,14 @@ def _make_worker(
     return worker
 
 
-def _make_env(judge_weight=0.0):
+def _make_env(judge_weight=0.0, stagger_delay_s=0.0):
     """Return a bare TauBenchEnvironment instance without spawning Ray actors."""
     cls = TauBenchEnvironment.__ray_metadata__.modified_class
     env = cls.__new__(cls)
     env.cfg = {}
     env._num_workers = 1
     env._judge_weight = judge_weight
+    env._stagger_delay_s = stagger_delay_s
     env._workers = []
     return env
 
@@ -173,10 +185,12 @@ class TestParseAction:
         assert action.name == "respond"
         assert action.kwargs == {"content": text}
 
-    def test_empty_string_returns_respond(self, worker):
+    def test_empty_string_returns_respond_with_placeholder(self, worker):
+        # Empty content is replaced with "[no response]" to avoid NVIDIA NIM
+        # rejecting messages with empty string content.
         action = worker._parse_action("")
         assert action.name == "respond"
-        assert action.kwargs["content"] == ""
+        assert action.kwargs["content"] == "[no response]"
 
     def test_tool_call_with_leading_trailing_text(self, worker):
         text = "Okay, I will cancel it now. <tool_call>{'name': 'cancel_order', 'arguments': {}}</tool_call> Done."
@@ -189,6 +203,133 @@ class TestParseAction:
         action = worker._parse_action(text)
         assert action.name == "find_user"
         assert action.kwargs == {"id": 1}
+
+
+# ===========================================================================
+# Tests: TauBenchWorker._call_with_retry
+# ===========================================================================
+
+
+class TestCallWithRetry:
+    @pytest.fixture
+    def worker(self):
+        return _make_worker()
+
+    def test_success_on_first_attempt_returns_result(self, worker):
+        result = worker._call_with_retry(lambda: 42)
+        assert result == 42
+
+    def test_retries_on_transient_error_and_eventually_succeeds(self, worker):
+        call_count = 0
+
+        def flaky():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise Exception("502 Bad Gateway")
+            return "ok"
+
+        with mock.patch("time.sleep"):
+            result = worker._call_with_retry(flaky)
+        assert result == "ok"
+        assert call_count == 3
+
+    def test_raises_runtime_error_after_max_retries_exhausted(self, worker):
+        def always_fails():
+            raise Exception("503 Service Unavailable")
+
+        with mock.patch("time.sleep"):
+            with pytest.raises(RuntimeError, match="API call failed after 4 attempts"):
+                worker._call_with_retry(always_fails, max_retries=3)
+
+    def test_non_transient_error_raises_immediately_without_retry(self, worker):
+        call_count = 0
+
+        def raises():
+            nonlocal call_count
+            call_count += 1
+            raise ValueError("something entirely unrelated")
+
+        with pytest.raises(RuntimeError, match="non-retryable"):
+            worker._call_with_retry(raises)
+        assert call_count == 1
+
+    def test_backoff_caps_double_each_retry(self, worker):
+        # Full-jitter: delay is uniform in [0, base * 2**attempt].
+        # Check that each sleep is within [0, cap] and caps double per attempt.
+        def always_fails():
+            raise Exception("502 Bad Gateway")
+
+        with mock.patch("time.sleep") as mock_sleep:
+            with pytest.raises(RuntimeError):
+                worker._call_with_retry(always_fails, max_retries=3, base_delay=1.0)
+        sleep_calls = [c.args[0] for c in mock_sleep.call_args_list]
+        assert len(sleep_calls) == 3
+        caps = [1.0, 2.0, 4.0]  # base * 2**attempt for attempts 0, 1, 2
+        for delay, cap in zip(sleep_calls, caps):
+            assert 0 <= delay <= cap, f"delay {delay} outside [0, {cap}]"
+
+    def test_all_transient_phrases_trigger_retry(self, worker):
+        for phrase in _TRANSIENT_HTTP_PHRASES:
+            call_count = 0
+
+            def flaky(p=phrase):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise Exception(f"upstream error: {p} occurred")
+                return "ok"
+
+            with mock.patch("time.sleep"):
+                result = worker._call_with_retry(flaky)
+            assert result == "ok", f"phrase {phrase!r} did not trigger a retry"
+
+    def test_custom_max_retries_respected(self, worker):
+        call_count = 0
+
+        def always_fails():
+            nonlocal call_count
+            call_count += 1
+            raise Exception("429 rate limit")
+
+        with mock.patch("time.sleep"):
+            with pytest.raises(RuntimeError):
+                worker._call_with_retry(always_fails, max_retries=1)
+        assert call_count == 2  # 1 initial attempt + 1 retry
+
+
+# ===========================================================================
+# Tests: TauBenchWorker.execute — initial_delay_s stagger
+# ===========================================================================
+
+
+class TestWorkerStagger:
+    """Verify that initial_delay_s causes a sleep at the start of execute()."""
+
+    @pytest.fixture
+    def worker(self):
+        return _make_worker()
+
+    def test_zero_delay_does_not_sleep(self, worker):
+        """initial_delay_s=0 must not call time.sleep at all."""
+        # Give the worker a trivially empty batch so execute() returns immediately.
+        with mock.patch("time.sleep") as mock_sleep:
+            worker.execute([], [], judge_weight=0.0, initial_delay_s=0.0)
+        mock_sleep.assert_not_called()
+
+    def test_nonzero_delay_sleeps_for_given_duration(self, worker):
+        """initial_delay_s > 0 must call time.sleep with that exact value."""
+        with mock.patch("time.sleep") as mock_sleep:
+            worker.execute([], [], judge_weight=0.0, initial_delay_s=3.5)
+        # The first sleep call must be the stagger delay; subsequent ones (if any)
+        # are backoff sleeps from _call_with_retry — we only check the first.
+        assert mock_sleep.call_args_list[0] == mock.call(3.5)
+
+    def test_default_delay_is_zero(self, worker):
+        """execute() must default to initial_delay_s=0 (no sleep) for back-compat."""
+        with mock.patch("time.sleep") as mock_sleep:
+            worker.execute([], [], judge_weight=0.0)
+        mock_sleep.assert_not_called()
 
 
 # ===========================================================================
