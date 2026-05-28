@@ -769,11 +769,7 @@ def grpo_train_sync(
                         }
                     )
 
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
+                    seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=masking_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=master_config.grpo[
@@ -1011,9 +1007,13 @@ def grpo_train_sync(
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
-                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
-                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
-                metrics["masked_correct_pct"] = masked_correct_pct
+                metrics["max_seq_mult_prob_error"] = seq_error_result[
+                    "max_seq_mult_prob_error"
+                ]
+                metrics["num_masked_seqs_by_logprob_error"] = seq_error_result[
+                    "num_masked_seqs"
+                ]
+                metrics["masked_correct_pct"] = seq_error_result["masked_correct_pct"]
 
                 consumed_samples += master_config.grpo["num_prompts_per_step"]
                 timeout.mark_iteration()
