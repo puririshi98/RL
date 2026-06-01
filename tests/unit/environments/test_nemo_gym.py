@@ -25,7 +25,12 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig, setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    _detect_invalid_tool_call_and_malformed_thinking,
+    setup_nemo_gym_config,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -44,6 +49,48 @@ def test_nemo_gym_stub_module():
 
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
+    )
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize(
+    ("output_item_dict", "expected_invalid_tool_call", "expected_malformed_thinking"),
+    [
+        (
+            {"content": [{"text": "use <tool_call>{}</tool_call>"}]},
+            True,
+            False,
+        ),
+        (
+            {"content": [{"text": "final answer leaked <think>reasoning</think>"}]},
+            False,
+            True,
+        ),
+        (
+            {"type": "reasoning", "summary": [{"text": "<think>a</think>"}]},
+            False,
+            False,
+        ),
+        (
+            {"type": "reasoning", "summary": [{"text": "<think>a</think><think>b"}]},
+            False,
+            True,
+        ),
+        (
+            {"type": "reasoning", "summary": [{"text": "bad <function_call>{}"}]},
+            True,
+            False,
+        ),
+    ],
+)
+def test_detect_invalid_tool_call_and_malformed_thinking(
+    output_item_dict,
+    expected_invalid_tool_call,
+    expected_malformed_thinking,
+):
+    assert _detect_invalid_tool_call_and_malformed_thinking(output_item_dict) == (
+        expected_invalid_tool_call,
+        expected_malformed_thinking,
     )
 
 
@@ -224,6 +271,8 @@ def test_nemo_gym_sanity(
                 message["prompt_str"] = "dummy prompt_str"
             if "generation_str" in message:
                 message["generation_str"] = "dummy generation_str"
+            message.setdefault("is_invalid_tool_call", False)
+            message.setdefault("has_malformed_thinking", False)
 
         return d
 
