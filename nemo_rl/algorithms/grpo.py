@@ -169,6 +169,12 @@ class GRPOConfig(TypedDict):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None
+    # Advantage value to assign to invalid tool call tokens. When set (e.g. -5.0), overwrites the
+    # computed advantage for those tokens to penalize them; absent/None disables the penalty.
+    invalid_tool_call_advantage: NotRequired[float | None]
+    # Advantage value to assign to tokens with malformed <think>/</think> tags. When set (e.g. -5.0),
+    # overwrites the computed advantage for those tokens; absent/None disables the penalty.
+    malformed_thinking_advantage: NotRequired[float | None]
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
 
@@ -1074,6 +1080,64 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                 )
 
 
+def _apply_message_level_advantage_penalties(
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    repeated_batch: BatchedDataDict[Any],
+    master_config: MasterConfig,
+    log_config: bool = False,
+) -> None:
+    invalid_neg_adv = master_config.grpo.get("invalid_tool_call_advantage")
+    malformed_neg_adv = master_config.grpo.get("malformed_thinking_advantage")
+    if invalid_neg_adv is None and malformed_neg_adv is None:
+        return
+
+    if log_config:
+        print(
+            f"Invalid tool call advantage: {invalid_neg_adv}",
+            flush=True,
+        )
+        print(
+            f"Malformed thinking advantage: {malformed_neg_adv}",
+            flush=True,
+        )
+
+    for i, message_log in enumerate(repeated_batch["message_log"]):
+        token_offset = 0
+        for j, message in enumerate(message_log):
+            token_ids = cast(torch.Tensor, message["token_ids"])
+            msg_len = len(token_ids)
+            is_assistant = (
+                message["role"] == "assistant" and "generation_logprobs" in message
+            )
+            is_invalid = (
+                is_assistant
+                and invalid_neg_adv is not None
+                and message.get("is_invalid_tool_call", False)
+            )
+            is_malformed_thinking = (
+                is_assistant
+                and malformed_neg_adv is not None
+                and message.get("has_malformed_thinking", False)
+            )
+            if is_invalid:
+                print(
+                    f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
+                    flush=True,
+                )
+                train_data["advantages"][i, token_offset : token_offset + msg_len] = (
+                    invalid_neg_adv
+                )
+            elif is_malformed_thinking:
+                print(
+                    f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
+                    flush=True,
+                )
+                train_data["advantages"][i, token_offset : token_offset + msg_len] = (
+                    malformed_neg_adv
+                )
+            token_offset += msg_len
+
+
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
@@ -1970,6 +2034,10 @@ def grpo_train(
                         advantages=train_data["advantages"],
                     )
                     del baseline_for_log
+
+                    _apply_message_level_advantage_penalties(
+                        train_data, repeated_batch, master_config
+                    )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
@@ -3079,6 +3147,10 @@ def async_grpo_train(
                     advantages = train_data["advantages"]
                     print(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
+                    )
+
+                    _apply_message_level_advantage_penalties(
+                        train_data, repeated_batch, master_config, log_config=True
                     )
 
                 print("▶ Preparing for training...")

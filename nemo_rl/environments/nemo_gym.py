@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
 import torch
@@ -22,11 +22,74 @@ from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
+DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
+    "<tool_call>",
+    "</tool_call>",
+    "<function_call>",
+    "</function_call>",
+]
+DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
 
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    invalid_tool_call_patterns: NotRequired[
+        List[str] | None
+    ]  # Substrings in assistant text content that indicate an invalid tool call
+    thinking_tags: NotRequired[
+        List[str] | None
+    ]  # Thinking tags to check for malformed usage
+
+
+def _detect_invalid_tool_call_and_malformed_thinking(
+    output_item_dict: dict[str, Any],
+    invalid_tool_call_patterns: list[str] | None = None,
+    thinking_tags: list[str] | None = None,
+) -> tuple[bool, bool]:
+    invalid_tool_call_patterns = (
+        invalid_tool_call_patterns or DEFAULT_INVALID_TOOL_CALL_PATTERNS
+    )
+    thinking_tags = thinking_tags or DEFAULT_THINKING_TAGS
+
+    is_output_message = (
+        "content" in output_item_dict
+        and len(output_item_dict["content"]) > 0
+        and "text" in output_item_dict["content"][0]
+    )
+    # NeMo-Gym only attaches generation_token_ids to the last output item of a
+    # model call (see vllm_model/app.py postprocess_chat_response). So this item
+    # is guaranteed to be the final thing the model produced for this turn.
+    # If it's a reasoning item, the model output only reasoning (no content/tool calls).
+    is_reasoning_message = (
+        output_item_dict.get("type") == "reasoning"
+        and len(output_item_dict.get("summary", [])) > 0
+        and "text" in output_item_dict["summary"][0]
+    )
+
+    is_invalid_tool_call = False
+    has_malformed_thinking = False
+    if is_output_message:
+        assistant_message_content = output_item_dict["content"][0]["text"]
+        if any(
+            pattern in assistant_message_content
+            for pattern in invalid_tool_call_patterns
+        ):
+            is_invalid_tool_call = True
+        if any(tag in assistant_message_content for tag in thinking_tags):
+            has_malformed_thinking = True
+    elif is_reasoning_message:
+        assistant_message_content = output_item_dict["summary"][0]["text"]
+        if any(
+            pattern in assistant_message_content
+            for pattern in invalid_tool_call_patterns
+        ):
+            is_invalid_tool_call = True
+        if any(assistant_message_content.count(tag) > 1 for tag in thinking_tags):
+            has_malformed_thinking = True
+
+    return is_invalid_tool_call, has_malformed_thinking
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -213,6 +276,19 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     ),
                 }
             )
+            # Valid tool calls go through the structured API (tool_calls field) and get
+            # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
+            # the call was invalid and never executed — flag it so training can penalize it.
+            is_invalid_tool_call, has_malformed_thinking = (
+                _detect_invalid_tool_call_and_malformed_thinking(
+                    output_item_dict,
+                    invalid_tool_call_patterns=self.cfg.get(
+                        "invalid_tool_call_patterns"
+                    ),
+                    thinking_tags=self.cfg.get("thinking_tags"),
+                )
+            )
+
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
@@ -221,6 +297,8 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     "generation_logprobs": torch.tensor(
                         output_item_dict["generation_log_probs"]
                     ),
+                    "is_invalid_tool_call": is_invalid_tool_call,
+                    "has_malformed_thinking": has_malformed_thinking,
                 }
             )
 
