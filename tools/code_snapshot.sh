@@ -35,7 +35,7 @@ else
 fi
 
 echo2 "Copying git-tracked files and submodules (hardlinked)..."
-rsync -a --link-dest="$(pwd)" --files-from=<(
+rsync -aL --link-dest="$(pwd)" --files-from=<(
   git ls-files --recurse-submodules --cached --full-name
 ) ./ $SNAPSHOT_DIR/
 
