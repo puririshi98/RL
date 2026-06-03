@@ -15,7 +15,7 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run --locked examples/run_distillation.py \
+uv run examples/run_distillation.py \
     --config $CONFIG_PATH \
     distillation.max_num_steps=$MAX_STEPS \
     distillation.val_period=20 \
@@ -31,11 +31,11 @@ uv run --locked examples/run_distillation.py \
     2>&1 | tee $RUN_LOG
 
 # Convert tensorboard logs to json
-uv run --locked tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run --locked tests/check_metrics.py $JSON_METRICS \
+    uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 1.5' \
         'data["train/loss"]["10"] < 0.5' \
         'max(data["ray/node.0.gpu.0.mem_gb"]) < 150' \

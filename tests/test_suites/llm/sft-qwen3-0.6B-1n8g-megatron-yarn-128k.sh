@@ -14,7 +14,7 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run --locked examples/run_sft.py \
+uv run examples/run_sft.py \
     --config $CONFIG_PATH \
     sft.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
@@ -29,10 +29,10 @@ uv run --locked examples/run_sft.py \
     2>&1 | tee $RUN_LOG
 
 # Convert tensorboard logs to json
-uv run --locked tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run --locked tests/check_metrics.py $JSON_METRICS \
+    uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] < 1.4' \
         'data["train/loss"]["20"] < 0.9' \
         'data["validation/val_loss"]["20"] < 1.0'

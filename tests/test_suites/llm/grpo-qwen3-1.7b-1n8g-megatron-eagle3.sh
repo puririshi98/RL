@@ -17,7 +17,7 @@ POLICY_MODEL=${NRL_EAGLE3_POLICY_MODEL:-Qwen/Qwen3-1.7B}
 DRAFT_MODEL=${NRL_EAGLE3_DRAFT_MODEL:-AngelSlim/Qwen3-1.7B_eagle3}
 
 cd $PROJECT_ROOT
-uv run --locked examples/run_grpo.py \
+uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     policy.model_name="$POLICY_MODEL" \
     policy.tokenizer.name="$POLICY_MODEL" \
@@ -42,10 +42,10 @@ fi
 
 grep -q "Draft Loss:" "$RUN_LOG"
 
-uv run --locked tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run --locked tests/check_metrics.py $JSON_METRICS \
+    uv run tests/check_metrics.py $JSON_METRICS \
         'min(data["train/draft_loss"]) > 0' \
         'data["train/draft_loss"]["50"] < 4'
 

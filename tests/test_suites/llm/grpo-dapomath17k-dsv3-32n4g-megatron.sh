@@ -23,7 +23,7 @@ fi
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run --locked examples/run_grpo.py \
+uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     policy.model_name=$NRL_DEEPSEEK_V3_BF16_CKPT \
     grpo.max_num_steps=$MAX_STEPS \
@@ -39,11 +39,11 @@ uv run --locked examples/run_grpo.py \
     2>&1 | tee $RUN_LOG
 
 # Convert tensorboard logs to json
-uv run --locked tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run --locked tests/check_metrics.py $JSON_METRICS \
+    uv run tests/check_metrics.py $JSON_METRICS \
         'min(data["train/token_mult_prob_error"]) < 1.05' \
         'max(data["train/reward"]) > 0.4' \
         'mean(data["timing/train/total_step_time"], -6, -1) < 1000'
